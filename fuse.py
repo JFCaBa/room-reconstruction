@@ -75,61 +75,47 @@ def arkit_centers(manifest):
     return np.array(centers, float), names
 
 
-def unproject_depth(npz, ext, conf_min=0.0, edge_rel=0.05, max_depth=None, rgb=None):
-    """Build the dense cloud (M,3) + per-point conf (M,) from per-frame depth + intrinsics + c2w.
+def unproject_depth(npz, ext, conf_pct=50.0, max_depth=None, rgb=None):
+    """Build the dense cloud (M,3) + per-point conf (M,) from per-frame depth — EXACTLY as lingbot's
+    own viewer does (its clean "photos on the walls" look), then make it metric downstream.
 
-    Streaming inference returns depth (not a prebuilt world_points), so we back-project: a pixel (u,v)
-    with depth d maps to camera point ((u-cx)/fx·d, (v-cy)/fy·d, d) (OpenCV pinhole), then to lingbot
-    world via the c2w extrinsic. Points stay in lingbot's frame/scale — the SAME frame as the camera
-    centres used for alignment — so the recovered Sim(3) applies to them unchanged.
+    lingbot's `extrinsic` is the OpenCV "cam from world" (world-to-camera) matrix, NOT c2w. We hand it
+    straight to lingbot's `unproject_depth_map_to_point_map`, which inverts it correctly to place each
+    pixel in lingbot's world frame. (The earlier hand-rolled back-projection treated `extrinsic` as
+    c2w and used `cam @ R.T + t` with the wrong rotation/translation — that mis-placed every point and
+    was the real cause of the radial streaks / floaty cloud, not the depth itself.)
 
-    Cleanup applied per frame, at source:
-      - conf_min   : drop pixels with depth_conf below this.
-      - edge_rel   : drop "flying pixels" at depth discontinuities — where the local depth gradient
-                     exceeds edge_rel·depth. These boundary pixels are what render as radial streaks.
-      - max_depth  : drop pixels farther than this (lingbot units) — far background seen through
-                     doorways/windows that doesn't belong to the room shell.
+    Filtering matches the viewer too:
+      - conf_pct  : drop the lowest-confidence pct% of points by depth_conf percentile (viewer default
+                    init_conf_threshold=50). Replaces the old absolute-threshold + edge-gradient filter.
+      - max_depth : optionally drop points farther than this (lingbot units) — far background seen
+                    through doorways/windows that doesn't belong to the room shell.
     """
-    D = np.asarray(npz["depth"], float)
-    if D.ndim == 4:
-        D = D[..., 0]                                 # (N,H,W,1) -> (N,H,W)
+    from lingbot_map.utils.geometry import unproject_depth_map_to_point_map
+    D = np.asarray(npz["depth"], float)               # (N,H,W,1) or (N,H,W)
     K = np.asarray(npz["intrinsic"], float)           # (N,3,3) for the depth resolution
     C = np.asarray(npz["depth_conf"], float) if "depth_conf" in npz.files else None
-    N, H, W = D.shape
-    grid_v, grid_u = np.mgrid[0:H, 0:W].astype(float)
-    pts_all, conf_all = [], []
-    cols_all = [] if rgb is not None else None
-    for i in range(N):
-        d = D[i]                                       # (H,W)
-        gy, gx = np.gradient(d)
-        grad = np.hypot(gx, gy)
-        keep = d > 0
-        keep &= grad <= edge_rel * np.maximum(d, 1e-3)
-        if max_depth is not None:
-            keep &= d <= max_depth
-        if C is not None:
-            keep &= C[i] >= conf_min
-        if not keep.any():
-            continue
-        du = d[keep]
-        fx, fy, cx, cy = K[i, 0, 0], K[i, 1, 1], K[i, 0, 2], K[i, 1, 2]
-        cam = np.stack([(grid_u[keep] - cx) / fx * du,
-                        (grid_v[keep] - cy) / fy * du, du], 1)
-        world = cam @ ext[i, :3, :3].T + ext[i, :3, 3]
-        pts_all.append(world)
-        conf_all.append(C[i][keep] if C is not None else np.ones(len(du)))
-        if cols_all is not None:
-            cols_all.append(rgb[i][keep])              # source-photo colour per point
-    pts = np.concatenate(pts_all)
-    conf = np.concatenate(conf_all)
-    colors = np.concatenate(cols_all) if cols_all is not None else None
-    return pts, conf, colors
+    world = unproject_depth_map_to_point_map(D, ext, K)   # (N,H,W,3) in lingbot world frame
+    pts = world.reshape(-1, 3)
+    depth_flat = (D[..., 0] if D.ndim == 4 else D).reshape(-1)
+    conf = C.reshape(-1) if C is not None else np.ones(len(pts))
+    cols = rgb.reshape(-1, 3) if rgb is not None else None   # row-order matches world points
+    keep = np.isfinite(pts).all(1) & (depth_flat > 0)
+    if max_depth is not None:
+        keep &= depth_flat <= max_depth
+    if C is not None and conf_pct > 0:
+        thr = np.percentile(conf[keep], conf_pct)
+        keep &= conf >= thr
+    pts, conf = pts[keep], conf[keep]
+    cols = cols[keep] if cols is not None else None
+    return pts, conf, cols
 
 
-def lingbot_from_npz(npz, edge_rel=0.05, max_depth=None, rgb=None):
+def lingbot_from_npz(npz, conf_pct=50.0, max_depth=None, rgb=None):
     """lingbot camera centres (N,3), frame basenames, dense points (M,3), conf (M,), colours (M,3)|None."""
-    ext = np.asarray(npz["extrinsic"], float)        # (N,3,4) c2w; centre is column 3
-    centers = ext[:, :3, 3]
+    from lingbot_map.utils.geometry import closed_form_inverse_se3
+    ext = np.asarray(npz["extrinsic"], float)        # (N,3,4) OpenCV w2c (cam from world)
+    centers = closed_form_inverse_se3(ext)[:, :3, 3]  # true camera centres (c2w translation = -Rᵀt)
     names = [os.path.basename(str(p)) for p in npz["paths"]]
     if "world_points" in npz.files:
         pts = np.asarray(npz["world_points"], float).reshape(-1, 3)
@@ -137,7 +123,7 @@ def lingbot_from_npz(npz, edge_rel=0.05, max_depth=None, rgb=None):
                 if "world_points_conf" in npz.files else np.ones(len(pts)))
         colors = None
     else:                                             # streaming npz: derive cloud from depth
-        pts, conf, colors = unproject_depth(npz, ext, edge_rel=edge_rel, max_depth=max_depth, rgb=rgb)
+        pts, conf, colors = unproject_depth(npz, ext, conf_pct=conf_pct, max_depth=max_depth, rgb=rgb)
     return centers, names, pts, conf, colors
 
 
@@ -448,10 +434,10 @@ def main():
     ap.add_argument("--out-prefix", default=None,
                     help="write <prefix>_topdown.png and <prefix>_metric.ply")
     ap.add_argument("--conf", type=float, default=1.5,
-                    help="confidence threshold (world_points_conf, or depth_conf for streaming npz)")
-    ap.add_argument("--edge", type=float, default=0.05,
-                    help="depth-cloud edge filter: drop pixels whose depth gradient exceeds edge·depth "
-                         "(removes flying pixels / radial streaks). Streaming npz only.")
+                    help="absolute confidence threshold for the world_points branch (world_points_conf)")
+    ap.add_argument("--conf-pct", type=float, default=50.0,
+                    help="depth-cloud: drop the lowest-confidence pct%% of points (depth_conf "
+                         "percentile, like lingbot's viewer init_conf_threshold=50). Streaming npz only.")
     ap.add_argument("--max-depth", type=float, default=None,
                     help="drop depth-cloud points farther than this (lingbot units ~ metres) — "
                          "far background through openings. Streaming npz only.")
@@ -479,10 +465,12 @@ def main():
     if args.frames:
         names = [os.path.basename(str(p)) for p in npz["paths"]]
         rgb = load_frame_rgb(args.frames, names)
+    is_depth = "world_points" not in npz.files
     lb_c, lb_names, pts, conf, colors = lingbot_from_npz(
-        npz, edge_rel=args.edge, max_depth=args.max_depth, rgb=rgb)
+        npz, conf_pct=args.conf_pct, max_depth=args.max_depth, rgb=rgb)
+    # depth path already filtered by percentile; don't double-prune with the absolute threshold
     fuse(manifest, lb_c, lb_names, pts, conf,
-         conf_thresh=args.conf, max_points=args.max_points,
+         conf_thresh=(0.0 if is_depth else args.conf), max_points=args.max_points,
          voxel=args.voxel, sor_k=args.sor_k, sor_std=args.sor_std,
          colors=colors, out_prefix=args.out_prefix)
 

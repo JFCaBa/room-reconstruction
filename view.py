@@ -40,6 +40,25 @@ def wall_wireframe(fp):
     return seg, col
 
 
+def wall_dim_labels(fp):
+    """One length label per wall (measured metres), placed at the wall midpoint, nudged outward from
+    the room centre and up to floor+0.1 m — the same dimension read-out as the iOS footprint."""
+    floorY = fp["floorY"]
+    cen = np.array([np.mean([c[0] for c in fp["corners"]]),
+                    np.mean([c[2] for c in fp["corners"]])])
+    out = []
+    for i, w in enumerate(fp["walls"]):
+        a = np.array(w["start"], float); b = np.array(w["end"], float)
+        L = w.get("length") or float(np.hypot(*(b - a)[[0, 2]]))
+        mid = (a + b) / 2
+        m2 = np.array([mid[0], mid[2]])
+        d = m2 - cen
+        d = d / (np.linalg.norm(d) + 1e-9)
+        p = m2 + d * 0.12                                   # nudge just outside the wall
+        out.append((f"wall{i}", f"{L:.2f} m", (p[0], floorY + 0.1, p[1])))
+    return out
+
+
 def opening_wireframe(fp):
     """Openings as coloured rectangles on their wall. Returns (M,2,3),(M,2,3) or (None,None)."""
     floorY = fp["floorY"]
@@ -140,6 +159,15 @@ def main():
             server.scene.add_line_segments("/openings", points=oseg, colors=ocol, line_width=5.0)
         gseg, gcol = floor_grid(fp)
         server.scene.add_line_segments("/floor", points=gseg, colors=gcol, line_width=1.0)
+        # dimension labels — wall lengths + room height, like the iOS footprint
+        for name, text, pos in wall_dim_labels(fp):
+            server.scene.add_label(f"/dims/{name}", text, position=pos,
+                                   anchor="bottom-center")
+        H = fp.get("roomHeight") or 2.4
+        cy = fp["corners"][0]
+        server.scene.add_label("/dims/height", f"H {H:.2f} m",
+                               position=(cy[0], fp["floorY"] + H / 2, cy[2]),
+                               anchor="center-center")
     if manifest:
         cams = camera_centers(manifest)
         server.scene.add_point_cloud("/cameras", points=cams,
