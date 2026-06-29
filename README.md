@@ -69,8 +69,15 @@ python demo.py \
 python fuse.py \
   --manifest /path/to/<scan>/manifest.json \
   --npz out/<scan>_lingbot.npz \
+  --conf 3 --voxel 0.02 \
   --out-prefix out/<scan>_fused
 ```
+
+A streaming npz stores depth (not a prebuilt cloud), so `fuse.py` back-projects it and **cleans** it:
+`--conf` (depth_conf gate; ~1–14 for streaming, use **3** — higher prunes the ceiling/upper walls),
+`--edge` (drop flying pixels at depth edges), `--voxel` (downsample, uniformises density),
+`--sor-k`/`--sor-std` (statistical outlier removal). Defaults are sensible; `--conf 3 --voxel 0.02`
+is the recommended starting point for streaming captures.
 
 `fuse.py` prints the **recovered scale (m/unit)** and the **trajectory residual (cm)** — a low
 residual means the lingbot and ARKit camera trajectories genuinely agree, i.e. the metric fusion is
