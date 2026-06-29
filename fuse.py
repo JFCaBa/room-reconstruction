@@ -75,14 +75,45 @@ def arkit_centers(manifest):
     return np.array(centers, float), names
 
 
+def unproject_depth(npz, ext):
+    """Build the dense cloud (M,3) + per-point conf (M,) from per-frame depth + intrinsics + c2w.
+
+    Streaming inference returns depth (not a prebuilt world_points), so we back-project: a pixel (u,v)
+    with depth d maps to camera point ((u-cx)/fx·d, (v-cy)/fy·d, d) (OpenCV pinhole), then to lingbot
+    world via the c2w extrinsic. Points stay in lingbot's frame/scale — the SAME frame as the camera
+    centres used for alignment — so the recovered Sim(3) applies to them unchanged.
+    """
+    D = np.asarray(npz["depth"], float)
+    if D.ndim == 4:
+        D = D[..., 0]                                 # (N,H,W,1) -> (N,H,W)
+    K = np.asarray(npz["intrinsic"], float)           # (N,3,3) for the depth resolution
+    C = np.asarray(npz["depth_conf"], float) if "depth_conf" in npz.files else None
+    N, H, W = D.shape
+    uu, vv = np.meshgrid(np.arange(W), np.arange(H))
+    uu = uu.reshape(-1).astype(float); vv = vv.reshape(-1).astype(float)
+    pts_all, conf_all = [], []
+    for i in range(N):
+        d = D[i].reshape(-1)
+        fx, fy, cx, cy = K[i, 0, 0], K[i, 1, 1], K[i, 0, 2], K[i, 1, 2]
+        cam = np.stack([(uu - cx) / fx * d, (vv - cy) / fy * d, d], 1)
+        world = cam @ ext[i, :3, :3].T + ext[i, :3, 3]
+        c = C[i].reshape(-1) if C is not None else np.ones(len(d))
+        m = d > 0                                      # drop invalid/zero-depth pixels
+        pts_all.append(world[m]); conf_all.append(c[m])
+    return np.concatenate(pts_all), np.concatenate(conf_all)
+
+
 def lingbot_from_npz(npz):
     """lingbot camera centres (N,3), frame basenames, dense points (M,3), conf (M,)."""
     ext = np.asarray(npz["extrinsic"], float)        # (N,3,4) c2w; centre is column 3
     centers = ext[:, :3, 3]
     names = [os.path.basename(str(p)) for p in npz["paths"]]
-    pts = np.asarray(npz["world_points"], float).reshape(-1, 3)
-    conf = (np.asarray(npz["world_points_conf"], float).reshape(-1)
-            if "world_points_conf" in npz else np.ones(len(pts)))
+    if "world_points" in npz.files:
+        pts = np.asarray(npz["world_points"], float).reshape(-1, 3)
+        conf = (np.asarray(npz["world_points_conf"], float).reshape(-1)
+                if "world_points_conf" in npz.files else np.ones(len(pts)))
+    else:                                             # streaming npz: derive cloud from depth
+        pts, conf = unproject_depth(npz, ext)
     return centers, names, pts, conf
 
 
