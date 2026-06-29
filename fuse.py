@@ -75,7 +75,7 @@ def arkit_centers(manifest):
     return np.array(centers, float), names
 
 
-def unproject_depth(npz, ext, conf_min=0.0, edge_rel=0.05, max_depth=None):
+def unproject_depth(npz, ext, conf_min=0.0, edge_rel=0.05, max_depth=None, rgb=None):
     """Build the dense cloud (M,3) + per-point conf (M,) from per-frame depth + intrinsics + c2w.
 
     Streaming inference returns depth (not a prebuilt world_points), so we back-project: a pixel (u,v)
@@ -98,6 +98,7 @@ def unproject_depth(npz, ext, conf_min=0.0, edge_rel=0.05, max_depth=None):
     N, H, W = D.shape
     grid_v, grid_u = np.mgrid[0:H, 0:W].astype(float)
     pts_all, conf_all = [], []
+    cols_all = [] if rgb is not None else None
     for i in range(N):
         d = D[i]                                       # (H,W)
         gy, gx = np.gradient(d)
@@ -117,11 +118,16 @@ def unproject_depth(npz, ext, conf_min=0.0, edge_rel=0.05, max_depth=None):
         world = cam @ ext[i, :3, :3].T + ext[i, :3, 3]
         pts_all.append(world)
         conf_all.append(C[i][keep] if C is not None else np.ones(len(du)))
-    return np.concatenate(pts_all), np.concatenate(conf_all)
+        if cols_all is not None:
+            cols_all.append(rgb[i][keep])              # source-photo colour per point
+    pts = np.concatenate(pts_all)
+    conf = np.concatenate(conf_all)
+    colors = np.concatenate(cols_all) if cols_all is not None else None
+    return pts, conf, colors
 
 
-def lingbot_from_npz(npz, edge_rel=0.05, max_depth=None):
-    """lingbot camera centres (N,3), frame basenames, dense points (M,3), conf (M,)."""
+def lingbot_from_npz(npz, edge_rel=0.05, max_depth=None, rgb=None):
+    """lingbot camera centres (N,3), frame basenames, dense points (M,3), conf (M,), colours (M,3)|None."""
     ext = np.asarray(npz["extrinsic"], float)        # (N,3,4) c2w; centre is column 3
     centers = ext[:, :3, 3]
     names = [os.path.basename(str(p)) for p in npz["paths"]]
@@ -129,9 +135,19 @@ def lingbot_from_npz(npz, edge_rel=0.05, max_depth=None):
         pts = np.asarray(npz["world_points"], float).reshape(-1, 3)
         conf = (np.asarray(npz["world_points_conf"], float).reshape(-1)
                 if "world_points_conf" in npz.files else np.ones(len(pts)))
+        colors = None
     else:                                             # streaming npz: derive cloud from depth
-        pts, conf = unproject_depth(npz, ext, edge_rel=edge_rel, max_depth=max_depth)
-    return centers, names, pts, conf
+        pts, conf, colors = unproject_depth(npz, ext, edge_rel=edge_rel, max_depth=max_depth, rgb=rgb)
+    return centers, names, pts, conf, colors
+
+
+def load_frame_rgb(frames_dir, names, image_size=518):
+    """Replay lingbot's preprocessing to get RGB pixel-aligned to the depth grid: (N,H,W,3) uint8.
+    Same call/args as demo.py, in the npz frame order, so colours map 1:1 onto unprojected points."""
+    from lingbot_map.utils.load_fn import load_and_preprocess_images
+    paths = [os.path.join(frames_dir, n) for n in names]
+    t = load_and_preprocess_images(paths, mode="crop", image_size=image_size, patch_size=14)
+    return (t.numpy().transpose(0, 2, 3, 1) * 255).clip(0, 255).astype(np.uint8)
 
 
 def match_by_name(names_a, names_b):
@@ -141,23 +157,29 @@ def match_by_name(names_a, names_b):
     return pairs
 
 
-def write_ply(path, pts, conf=None):
-    """Binary little-endian PLY: x y z (+ optional float 'confidence')."""
+def write_ply(path, pts, conf=None, colors=None):
+    """Binary little-endian PLY: x y z, plus uchar r g b if colours given, else float confidence."""
     pts = np.asarray(pts, np.float32)
-    has_conf = conf is not None
+    n = len(pts)
+    fields = [("x", "<f4"), ("y", "<f4"), ("z", "<f4")]
+    props = ["property float x", "property float y", "property float z"]
+    if colors is not None:
+        fields += [("red", "u1"), ("green", "u1"), ("blue", "u1")]
+        props += ["property uchar red", "property uchar green", "property uchar blue"]
+    elif conf is not None:
+        fields += [("confidence", "<f4")]
+        props += ["property float confidence"]
+    rec = np.zeros(n, dtype=fields)
+    rec["x"], rec["y"], rec["z"] = pts[:, 0], pts[:, 1], pts[:, 2]
+    if colors is not None:
+        c = np.asarray(colors, np.uint8)
+        rec["red"], rec["green"], rec["blue"] = c[:, 0], c[:, 1], c[:, 2]
+    elif conf is not None:
+        rec["confidence"] = np.asarray(conf, np.float32)
+    hdr = "\n".join(["ply", "format binary_little_endian 1.0", f"element vertex {n}",
+                     *props, "end_header", ""])
     with open(path, "wb") as fh:
-        hdr = ["ply", "format binary_little_endian 1.0", f"element vertex {len(pts)}",
-               "property float x", "property float y", "property float z"]
-        if has_conf:
-            hdr.append("property float confidence")
-        hdr += ["end_header", ""]
-        fh.write(("\n".join(hdr)).encode())
-        if has_conf:
-            rec = np.empty((len(pts), 4), np.float32)
-            rec[:, :3] = pts
-            rec[:, 3] = np.asarray(conf, np.float32)
-        else:
-            rec = pts
+        fh.write(hdr.encode())
         fh.write(rec.tobytes())
 
 
@@ -183,41 +205,33 @@ def opening_segment(fp, op):
 
 # ── cloud cleaning (metric space, after alignment) ───────────────────────────
 
-def voxel_downsample(pts, conf, voxel):
-    """Keep the highest-confidence point per `voxel`-metre cell. Uniformises the density (kills the
-    near-camera over-density that renders as radial fans) and shrinks the cloud cheaply."""
-    keys = np.floor(pts / voxel).astype(np.int64)
-    keys -= keys.min(0)
-    dims = keys.max(0) + 1
-    flat = (keys[:, 0] * dims[1] + keys[:, 1]) * dims[2] + keys[:, 2]
-    order = np.lexsort((-conf, flat))          # within each voxel, highest conf sorts first
-    flat_o = flat[order]
-    first = np.empty(len(flat_o), bool)
-    first[0] = True
-    first[1:] = flat_o[1:] != flat_o[:-1]
-    sel = order[first]
-    return pts[sel], conf[sel]
-
-
-def remove_outliers(pts, conf, k=16, std_ratio=2.0):
-    """Statistical outlier removal: drop points whose mean distance to their k nearest neighbours is
-    an outlier (> mean + std_ratio·std). Clears isolated flecks and the thin streak tails."""
-    from scipy.spatial import cKDTree
-    if len(pts) <= k:
-        return pts, conf
-    tree = cKDTree(pts)
-    d, _ = tree.query(pts, k=k + 1, workers=-1)
-    md = d[:, 1:].mean(1)
-    keep = md <= md.mean() + std_ratio * md.std()
-    return pts[keep], conf[keep]
-
-
-def clean_cloud(pts, conf, voxel=0.02, sor_k=16, sor_std=2.0):
+def clean_cloud(pts, conf, colors=None, voxel=0.02, sor_k=16, sor_std=2.0):
+    """Voxel downsample (highest-conf point per cell) + statistical outlier removal. Carries an
+    optional per-point colour array through the same selection so colours stay aligned."""
     if voxel and voxel > 0:
-        pts, conf = voxel_downsample(pts, conf, voxel)
+        keys = np.floor(pts / voxel).astype(np.int64)
+        keys -= keys.min(0)
+        dims = keys.max(0) + 1
+        flat = (keys[:, 0] * dims[1] + keys[:, 1]) * dims[2] + keys[:, 2]
+        order = np.lexsort((-conf, flat))
+        flat_o = flat[order]
+        first = np.empty(len(flat_o), bool)
+        first[0] = True
+        first[1:] = flat_o[1:] != flat_o[:-1]
+        idx = order[first]
+        pts, conf = pts[idx], conf[idx]
+        if colors is not None:
+            colors = colors[idx]
     if sor_k and sor_k > 0:
-        pts, conf = remove_outliers(pts, conf, sor_k, sor_std)
-    return pts, conf
+        from scipy.spatial import cKDTree
+        if len(pts) > sor_k:
+            d, _ = cKDTree(pts).query(pts, k=sor_k + 1, workers=-1)
+            md = d[:, 1:].mean(1)
+            keep = md <= md.mean() + sor_std * md.std()
+            pts, conf = pts[keep], conf[keep]
+            if colors is not None:
+                colors = colors[keep]
+    return pts, conf, colors
 
 
 def robust_ceiling(height_above):
@@ -234,7 +248,7 @@ def robust_ceiling(height_above):
 # ── reporting + render ───────────────────────────────────────────────────────
 
 def fuse(manifest, lb_centers, lb_names, pts, conf, conf_thresh, max_points,
-         voxel=0.02, sor_k=16, sor_std=2.0, out_prefix=None, quiet=False):
+         voxel=0.02, sor_k=16, sor_std=2.0, colors=None, out_prefix=None, quiet=False):
     """Run the alignment and (optionally) render/export. Returns a result dict."""
     ak_c, ak_names = arkit_centers(manifest)
     pairs = match_by_name(ak_names, lb_names)
@@ -250,11 +264,14 @@ def fuse(manifest, lb_centers, lb_names, pts, conf, conf_thresh, max_points,
     keep = conf >= conf_thresh
     pts_m = apply_sim3(s, R, t, pts[keep])
     conf_m = conf[keep]
+    col_m = colors[keep] if colors is not None else None
     raw_n = len(pts_m)
-    pts_m, conf_m = clean_cloud(pts_m, conf_m, voxel=voxel, sor_k=sor_k, sor_std=sor_std)
+    pts_m, conf_m, col_m = clean_cloud(pts_m, conf_m, col_m, voxel=voxel, sor_k=sor_k, sor_std=sor_std)
     if max_points and len(pts_m) > max_points:
         sel = np.random.default_rng(0).choice(len(pts_m), max_points, replace=False)
         pts_m, conf_m = pts_m[sel], conf_m[sel]
+        if col_m is not None:
+            col_m = col_m[sel]
 
     fp = manifest.get("floorPlan")
     floor_y = fp["floorY"] if fp else float(np.percentile(pts_m[:, 1], 2))
@@ -297,9 +314,10 @@ def fuse(manifest, lb_centers, lb_names, pts, conf, conf_thresh, max_points,
 
     if out_prefix:
         _render(out_prefix + "_topdown.png", Xb, Zb, fp, res, s)
-        write_ply(out_prefix + "_metric.ply", pts_m, conf_m)
+        write_ply(out_prefix + "_metric.ply", pts_m, conf=conf_m, colors=col_m)
         if not quiet:
-            print(f"wrote {out_prefix}_topdown.png and {out_prefix}_metric.ply")
+            print(f"wrote {out_prefix}_topdown.png and {out_prefix}_metric.ply"
+                  + ("  (photo-coloured)" if col_m is not None else ""))
     return res
 
 
@@ -444,6 +462,9 @@ def main():
     ap.add_argument("--sor-std", type=float, default=2.0,
                     help="statistical outlier removal: keep points within mean+std·this")
     ap.add_argument("--max-points", type=int, default=600000, help="cap cloud size (0 = no cap)")
+    ap.add_argument("--frames", default=None,
+                    help="frames dir of the scan — colours each point with its source-photo pixel "
+                         "(replays lingbot preprocessing; streaming npz only)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -454,10 +475,16 @@ def main():
 
     manifest = json.load(open(args.manifest))
     npz = np.load(args.npz, allow_pickle=True)
-    lb_c, lb_names, pts, conf = lingbot_from_npz(npz, edge_rel=args.edge, max_depth=args.max_depth)
+    rgb = None
+    if args.frames:
+        names = [os.path.basename(str(p)) for p in npz["paths"]]
+        rgb = load_frame_rgb(args.frames, names)
+    lb_c, lb_names, pts, conf, colors = lingbot_from_npz(
+        npz, edge_rel=args.edge, max_depth=args.max_depth, rgb=rgb)
     fuse(manifest, lb_c, lb_names, pts, conf,
          conf_thresh=args.conf, max_points=args.max_points,
-         voxel=args.voxel, sor_k=args.sor_k, sor_std=args.sor_std, out_prefix=args.out_prefix)
+         voxel=args.voxel, sor_k=args.sor_k, sor_std=args.sor_std,
+         colors=colors, out_prefix=args.out_prefix)
 
 
 if __name__ == "__main__":

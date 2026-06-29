@@ -84,6 +84,20 @@ residual means the lingbot and ARKit camera trajectories genuinely agree, i.e. t
 trustworthy. Outputs: `<prefix>_topdown.png` (dense footprint with the measured walls/openings
 overlaid) and `<prefix>_metric.ply` (dense cloud in metres, ARKit world).
 
+Add `--frames /path/to/<scan>/frames` to **colour each point with its source-photo pixel** (replays
+lingbot's preprocessing so colours align 1:1 with the depth) — the `.ply` then carries real RGB.
+
+## 3D viewer
+
+```bash
+python view.py out/<scan>_fused_metric.ply --manifest /path/to/<scan>/manifest.json
+# then open http://localhost:8080
+```
+
+Serves an interactive 3D view (viser) of the dense cloud — photo-coloured if the `.ply` has colours,
+else height-coloured — with the measured floor-plan wireframe (walls + openings) and the camera path,
+all in metres. Needs the `[vis]` extra.
+
 ## Validate the fusion math without a GPU
 
 ```bash
