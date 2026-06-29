@@ -64,6 +64,22 @@ def opening_wireframe(fp):
     return seg, col
 
 
+def floor_grid(fp, step=0.5):
+    """A faint reference grid in the floor plane (y = floorY) over the room's footprint bbox."""
+    floorY = fp["floorY"]
+    cs = np.array([[c[0], c[2]] for c in fp["corners"]])
+    x0, z0 = np.floor(cs.min(0) / step) * step
+    x1, z1 = np.ceil(cs.max(0) / step) * step
+    segs = []
+    for x in np.arange(x0, x1 + step / 2, step):
+        segs.append([[x, floorY, z0], [x, floorY, z1]])
+    for z in np.arange(z0, z1 + step / 2, step):
+        segs.append([[x0, floorY, z], [x1, floorY, z]])
+    seg = np.array(segs, np.float32)
+    col = np.tile(np.array([90, 110, 120], np.uint8), (len(seg), 2, 1))
+    return seg, col
+
+
 def camera_centers(manifest):
     return np.array([[f["transform"][3], f["transform"][7], f["transform"][11]]
                      for f in manifest["frames"]], np.float32)
@@ -75,6 +91,8 @@ def main():
     ap.add_argument("--manifest", default=None)
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--point-size", type=float, default=0.012)
+    ap.add_argument("--no-clip", action="store_true",
+                    help="don't clip the cloud to the measured room box")
     args = ap.parse_args()
 
     mesh = trimesh.load(args.ply, process=False)
@@ -96,18 +114,33 @@ def main():
     except Exception:
         pass
 
+    manifest = json.load(open(args.manifest)) if args.manifest else None
+    fp = manifest.get("floorPlan") if manifest else None
+
+    # Clip the cloud to the measured room box (drops above-ceiling noise + stray points outside the
+    # walls) so the view is clean. The cloud's own floor is wherever lingbot reconstructed to.
+    if fp and not args.no_clip:
+        floorY = fp["floorY"]; ceil = floorY + (fp.get("roomHeight") or 2.4)
+        cs = np.array([[c[0], c[2]] for c in fp["corners"]])
+        lo = cs.min(0) - 0.3; hi = cs.max(0) + 0.3
+        m = ((pts[:, 1] > floorY - 0.1) & (pts[:, 1] < ceil + 0.1)
+             & (pts[:, 0] > lo[0]) & (pts[:, 0] < hi[0])
+             & (pts[:, 2] > lo[1]) & (pts[:, 2] < hi[1]))
+        pts, cloud_colors = pts[m], cloud_colors[m]
+        print(f"clipped to room box: {m.sum():,} points")
+
     server.scene.add_point_cloud("/cloud", points=pts, colors=cloud_colors,
                                  point_size=args.point_size)
 
-    if args.manifest:
-        manifest = json.load(open(args.manifest))
-        fp = manifest.get("floorPlan")
-        if fp:
-            seg, col = wall_wireframe(fp)
-            server.scene.add_line_segments("/walls", points=seg, colors=col, line_width=3.0)
-            oseg, ocol = opening_wireframe(fp)
-            if oseg is not None:
-                server.scene.add_line_segments("/openings", points=oseg, colors=ocol, line_width=5.0)
+    if fp:
+        seg, col = wall_wireframe(fp)
+        server.scene.add_line_segments("/walls", points=seg, colors=col, line_width=3.0)
+        oseg, ocol = opening_wireframe(fp)
+        if oseg is not None:
+            server.scene.add_line_segments("/openings", points=oseg, colors=ocol, line_width=5.0)
+        gseg, gcol = floor_grid(fp)
+        server.scene.add_line_segments("/floor", points=gseg, colors=gcol, line_width=1.0)
+    if manifest:
         cams = camera_centers(manifest)
         server.scene.add_point_cloud("/cameras", points=cams,
                                      colors=np.tile([255, 60, 60], (len(cams), 1)).astype(np.uint8),
