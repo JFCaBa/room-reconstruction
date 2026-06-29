@@ -1,0 +1,24 @@
+room-reconstruction
+===================
+
+This repository is a derivative work that bundles the inference code of LingBot-Map
+together with a metric-fusion step for ARKit room scans.
+
+Includes code from:
+  LingBot-Map (https://github.com/<upstream>/lingbot-map), licensed under Apache-2.0.
+  Vendored at upstream commit 7ae07810ddac6f449f856ca0f6260ab3e1dcaa84.
+  Files: the `lingbot_map/` package, `demo.py`, `pyproject.toml`, `LICENSE`.
+
+Modifications made to the original LingBot-Map work:
+  - demo.py: added a `--save_npz` flag that writes per-frame extrinsics/intrinsics and
+    world_points(+conf) to a .npz (then exits before the 3D viewer), so the geometry can be
+    consumed offline by the fusion step.
+  - Stripped material not needed for inference: example imagery, benchmarks, the paper PDF,
+    render assets, and git history.
+
+Original work added in this repository (not part of upstream LingBot-Map):
+  - fuse.py: metric fusion of the lingbot point cloud with an ARKit scan manifest via a
+    full-trajectory Umeyama Sim(3) alignment.
+
+LingBot-Map is distributed under the Apache License 2.0; see the LICENSE file. This derivative
+work is likewise distributed under Apache-2.0.

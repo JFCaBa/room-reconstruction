@@ -1,0 +1,19 @@
+# model weights (download separately — see README)
+checkpoints/
+*.pt
+*.safetensors
+
+# lingbot/fusion run artifacts
+*.npz
+*.ply
+*.glb
+*_topdown.png
+*_fused*.png
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+.DS_Store
