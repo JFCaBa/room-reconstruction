@@ -387,7 +387,7 @@ def main():
     parser.add_argument(
         "--offload_to_cpu",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Offload per-frame predictions to CPU during inference to cut GPU peak memory "
             "(on by default).  Use --no-offload_to_cpu to keep outputs on GPU.",
     )
@@ -462,10 +462,19 @@ def main():
         print(f"Casting aggregator to {dtype} (heads kept in fp32)")
         model.aggregator = model.aggregator.to(dtype=dtype)
 
-    images = images.to(device)
+    # Keep the full image stack on the GPU only when we actually need it resident:
+    # - --compile warms CUDA graphs from slices of this tensor and needs it on-device;
+    # - without offload, predictions stay on the GPU anyway, so images may as well too.
+    # Otherwise (the default streaming+offload path) leave the stack on CPU and let
+    # inference_streaming page each frame in on demand — GPU image memory is then O(1)
+    # per frame instead of O(num_frames), which is what keeps a 10 GB card under budget.
+    keep_images_on_gpu = (not args.offload_to_cpu) or args.compile or args.mode == "windowed"
+    if keep_images_on_gpu:
+        images = images.to(device)
     num_frames = images.shape[0]
     print(f"Input: {num_frames} frames, shape {tuple(images.shape)}")
     print(f"Mode: {args.mode}")
+    print(f"Image stack on: {images.device} (offload_to_cpu={args.offload_to_cpu})")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         print(
