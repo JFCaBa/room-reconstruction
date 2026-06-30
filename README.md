@@ -47,10 +47,21 @@ aligned to that trajectory, its dense cloud and the measured plan live in the sa
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[vis]"          # lingbot deps + matplotlib (fuse.py) + viewer
-pip install torch                # platform-specific; see https://pytorch.org
-# Optional, CUDA only — much faster streaming attention:
+
+# Install torch for YOUR platform — torch is NOT a declared dependency on purpose.
+# CUDA GPU (pick the index-url matching your CUDA version — see https://pytorch.org):
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+# Apple Silicon / CPU:
+#   pip install torch
+
+# Optional, CUDA only — faster streaming attention (else pass --use_sdpa, which also works on CUDA):
 #   pip install flashinfer-python
 ```
+
+> **Plain `pip install torch` often pulls the CPU-only build**, so `torch.cuda.is_available()`
+> returns `False` and the model silently runs on CPU. On a GPU box, install the CUDA wheel above and
+> verify with `python -c "import torch; print(torch.cuda.is_available())"` → must print `True`.
+> If FlashInfer isn't installed, add `--use_sdpa` (works on CUDA too, just a bit slower).
 
 Download the checkpoint (≈4.3 GB) into `checkpoints/` — see the upstream LingBot-Map release.
 
